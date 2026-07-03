@@ -1,0 +1,40 @@
+
+
+macro cache - python "C:\Users\karanvsi\PyCharmMiscProject\Global_cache.py" --rebuild --days-back 15000
+
+
+bigmove pipeline -
+
+"C:\Program Files\Python313\python.exe" "C:\Users\karanvsi\PyCharmMiscProject\Big_move_pipeline.py" ^
+--panel "C:\Users\karanvsi\Desktop\Kite Connect\out_rank_single\panel_cache.parquet" ^
+--features "C:\Users\karanvsi\Desktop\Kite Connect\out_rank_single\features_train.json" ^
+--out "C:\Users\karanvsi\PyCharmMiscProject\bigmove_deploy" ^
+--threshold-pct 5 ^
+--horizon 5 ^
+--label-mode both ^
+--train-on touch ^
+--test-frac 0.20 ^
+--top-adv 1000 ^
+--scale-pos-weight 1 ^
+--cal-frac 0.10
+
+
+
+bucket backtest - "C:\Program Files\Python313\python.exe" "C:\Users\karanvsi\PyCharmMiscProject\Bucket_backtest_updated.py" --preds "C:\Users\karanvsi\PyCharmMiscProject\bigmove_deploy\bigmove_scored_test.csv" --panel "C:\Users\karanvsi\Desktop\Kite Connect\out_rank_single\panel_cache.parquet" --prob-col prob --regime-col none --cost-bps 28 --horizon 5 --prob-min 0.45 --prob-step 0.05 --prob-max 0.80 --tp-atr "2,3,4" --sl-atr "1,1.5,2,3" --out-dir "C:\Users\karanvsi\PyCharmMiscProject\bigmove_bt_out"
+
+
+Log trade -
+
+
+python "C:\Users\karanvsi\PyCharmMiscProject\log_trade.py" ^
+--out "C:\Users\karanvsi\PyCharmMiscProject\bigmove_deploy\Trade log" ^
+--panel "C:\Users\karanvsi\Desktop\Kite Connect\Backtests\panel_cache.parquet" ^
+--wl-subdir "..\watchlists"
+
+
+Resolve forward -
+
+python C:\Users\karanvsi\PyCharmMiscProject\resolve_forward.py ^
+--out "C:\Users\karanvsi\PyCharmMiscProject\bigmove_deploy" ^
+--panel "C:\Users\karanvsi\Desktop\Kite Connect\out_rank_single\panel_cache.parquet"
+
