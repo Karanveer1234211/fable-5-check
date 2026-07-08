@@ -56,6 +56,13 @@ if "date" not in wl.columns:   # fall back to filename date if pipeline didn't w
     raise SystemExit("watchlist files need a 'date' column.")
 wl["date"] = mkdate(wl["date"])
 wl = wl.drop_duplicates(subset=[SYM, "date"], keep="first")
+# per-day rank (1 = highest prob). uses existing 'rank' column if the pipeline wrote
+# one; otherwise derives it from prob so the ENTIRE history gets banded retroactively.
+probcol = next((c for c in ("prob_bigmove", "prob", "probability", "score") if c in wl.columns), None)
+if "rank" not in wl.columns and probcol:
+    wl["rank"] = wl.groupby("date")[probcol].rank(ascending=False, method="first")
+if "rank" in wl.columns:
+    wl["rank"] = pd.to_numeric(wl["rank"], errors="coerce")
 print(f"loaded {len(wl)} predictions from {len(files)} daily watchlists "
       f"({wl['date'].min().date()} -> {wl['date'].max().date()})")
 
@@ -128,6 +135,20 @@ if len(done) >= 5:
               f"meanMAE {dd.mae_5.mean()*100:+6.2f}%  meanMFE {dd.mfe_5.mean()*100:+6.2f}%")
 
     print("=== FORWARD SCORECARD (frozen model, live) ===")
+    if "rank" in done.columns and done["rank"].notna().any():
+        top3 = done[done["rank"] <= 3]; top5 = done[done["rank"] <= 5]
+        mid  = done[(done["rank"] >= 6) & (done["rank"] <= 10)]
+        rest = done[done["rank"] >= 11]
+        print("  -- by rank band (what you actually trade is the top band) --")
+        card(top3, "top 3 / day")
+        card(top5, "top 5 / day")
+        card(mid,  "rank 6-10")
+        card(rest, "rank 11+")
+        if "vol_skip" in done.columns:
+            print("  -- vol_skip WITHIN top-5 (where it would bind) --")
+            card(top5[top5["vol_skip"] == 0], "top5 kept (vol_skip=0)")
+            card(top5[top5["vol_skip"] == 1], "top5 flagged (vol_skip=1)")
+        print("  -- full cutoff list (context) --")
     card(done, "all resolved")
     if "vol_skip" in done.columns:
         card(done[done["vol_skip"] == 0], "kept (vol_skip=0)")
@@ -146,9 +167,11 @@ taken_candidates = [os.path.join(args.out, "taken_trades.csv"),
                     os.path.join(args.out, "Trade log", "taken_trades.csv")]
 taken_path = next((p for p in taken_candidates if os.path.exists(p)), None)
 
-def resolve_from_entry(sym, entry_dt):
+def resolve_from_entry(sym, entry_dt, tp=0.15, sl=0.15):
     """Resolve the system's H-session window anchored to the user's ACTUAL entry date
-    (not the watchlist date) -- entry = that day's open, exit = H-th session close."""
+    (not the watchlist date) -- entry = that day's open, exit = H-th session close.
+    ALSO resolves the +tp/-sl BRACKET (the rule actually traded live): walk the days,
+    SL assumed to fill first if both touch the same day (conservative)."""
     g = by_sym.get(sym)
     if g is None or pd.isna(entry_dt):
         return None
@@ -162,7 +185,16 @@ def resolve_from_entry(sym, entry_dt):
     if not np.isfinite(e) or e <= 0:
         return None
     c5 = float(fut["close"].iloc[-1]); hi = float(fut["high"].max()); lo = float(fut["low"].min())
-    return dict(entry_open=e, close_d5=c5, ret_5=c5/e - 1.0, mfe_5=hi/e - 1.0, mae_5=lo/e - 1.0)
+    # bracket walk
+    br = c5 / e - 1.0; br_exit = "horizon"
+    up = e * (1 + tp); dn = e * (1 - sl)
+    for k in range(len(fut)):
+        if float(fut["low"].iloc[k]) <= dn:
+            br = -sl; br_exit = f"SL_d{k+1}"; break
+        if float(fut["high"].iloc[k]) >= up:
+            br = tp; br_exit = f"TP_d{k+1}"; break
+    return dict(entry_open=e, close_d5=c5, ret_5=c5/e - 1.0, mfe_5=hi/e - 1.0,
+                mae_5=lo/e - 1.0, bracket_ret=br, bracket_exit=br_exit)
 
 if taken_path:
     tk = pd.read_csv(taken_path)
@@ -178,9 +210,17 @@ if taken_path:
             d["sys_5d_pct"] = round(sysr["ret_5"] * 100.0, 3)
             d["sys_mae_5"] = round(sysr["mae_5"] * 100.0, 3)
             d["sys_mfe_5"] = round(sysr["mfe_5"] * 100.0, 3)
+            d["sys_bracket_pct"] = round(sysr["bracket_ret"] * 100.0, 3)
+            d["sys_bracket_exit"] = sysr["bracket_exit"]
             ep = d.get("entry_price"); xp = d.get("exit_price"); q = d.get("qty")
             d["hold_from_my_entry_pct"] = round((sysr["close_d5"]/float(ep) - 1.0)*100.0, 3) \
                 if pd.notna(ep) and float(ep) > 0 else np.nan
+            # your realized exit vs the BRACKET (the rule you actually trade):
+            # bracket applied from the system's open on your entry day; positive gap =
+            # your hand beat the bracket on this trade, negative = the bracket beat you.
+            rp_row = d.get("realized_pnl_pct")
+            d["you_minus_bracket_pct"] = round(float(rp_row) - d["sys_bracket_pct"], 3) \
+                if pd.notna(rp_row) else np.nan
             if pd.notna(xp) and float(xp) > 0:
                 d["variance_pct"] = round((sysr["close_d5"]/float(xp) - 1.0)*100.0, 3)
                 d["variance_abs"] = round((sysr["close_d5"] - float(xp)) * float(q), 2) \
@@ -190,7 +230,9 @@ if taken_path:
             d["sys_resolved"] = True
         else:
             for c in ["sys_close_d5","sys_5d_pct","sys_mae_5","sys_mfe_5",
-                      "hold_from_my_entry_pct","variance_pct","variance_abs"]:
+                      "sys_bracket_pct","sys_bracket_exit",
+                      "hold_from_my_entry_pct","you_minus_bracket_pct",
+                      "variance_pct","variance_abs"]:
                 d[c] = np.nan
             d["sys_resolved"] = False
         recs.append(d)
@@ -202,12 +244,22 @@ if taken_path:
     print(f"  logged {len(j)} | system-resolved {len(matured)} | exited & resolved {len(ex)}")
     if len(ex):
         rp = pd.to_numeric(ex.get("realized_pnl_pct"), errors="coerce")
+        br = pd.to_numeric(ex.get("sys_bracket_pct"), errors="coerce")
+        ymb = pd.to_numeric(ex.get("you_minus_bracket_pct"), errors="coerce")
         print(f"  your realized exit  : mean {rp.mean():+6.2f}%")
-        print(f"  system to day-5     : mean {ex['sys_5d_pct'].mean():+6.2f}%   (your entry -> 5th session close)")
+        print(f"  system BRACKET      : mean {br.mean():+6.2f}%   (+15%/-15% GTT from your entry day's open)")
+        print(f"  YOU minus BRACKET   : mean {ymb.mean():+6.2f}%   <-- THE verdict column: + = your hand wins, - = the GTT wins")
+        print(f"  system to day-5     : mean {ex['sys_5d_pct'].mean():+6.2f}%   (naive hold, context only)")
         print(f"  early-exit variance : mean {ex['variance_pct'].mean():+6.2f}%   "
               f"total Rs {np.nansum(pd.to_numeric(ex['variance_abs'], errors='coerce')):+,.0f}")
-        print("  Read: +variance = money left on the table by exiting early; - = drawdown dodged.")
-        print("        Watch the SIGN over many trades -- whether your early exits help or hurt.")
+        print("  -- per trade (you vs bracket) --")
+        for t in ex.itertuples(index=False):
+            td = t._asdict()
+            print(f"    {str(td.get(SYM)):12} {str(td.get('entry_date','')):11} "
+                  f"you {float(td.get('realized_pnl_pct') or 0):+7.2f}%  "
+                  f"bracket {float(td.get('sys_bracket_pct') or 0):+7.2f}% ({td.get('sys_bracket_exit')})  "
+                  f"gap {float(td.get('you_minus_bracket_pct') or 0):+7.2f}%")
+        print("  Judge YOU-minus-BRACKET over 30-40 trades; one week decides nothing.")
     else:
         print("  (no exited trades have matured 5 sessions yet -- variance fills in as they age.)")
     print("  wrote taken_trades_resolved.csv")
